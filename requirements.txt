@@ -1,0 +1,7 @@
+python-dotenv
+python-telegram-bot
+requests
+garminconnect
+garth
+langchain-google-genai
+pydantic
