@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Tokens / local state
+tokenstore/
+*.token
+*.json
+
+# Logs
+*.log
