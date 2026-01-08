@@ -1,13 +1,61 @@
-# Python
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+pip-wheel-metadata/
+
+# --- Virtual envs ---
 .venv/
+venv/
+ENV/
+env/
+
+# --- Environment / secrets ---
 .env
+.env.*
+!.env.example
 
-# Tokens / local state
-tokenstore/
-*.token
-*.json
-
-# Logs
+# --- Logs ---
 *.log
+logs/
+log/
+
+# --- Local state / tokens / exports (SENSITIVE) ---
+# Garmin token store base (your code defaults to ~/.garth but allow repo-local too)
+.garth/
+garth/
+tokenstore/
+tokens/
+*.token
+*.tokens
+*.session
+*.pickle
+
+# Your code creates this folder (can contain personal Garmin exports)
+your_data/
+
+# --- Telegram / runtime artifacts ---
+*.sqlite
+*.db
+
+# --- Optional: Docker / compose local overrides ---
+docker-compose.override.yml
+
+# --- Optional: Jupyter ---
+.ipynb_checkpoints/
