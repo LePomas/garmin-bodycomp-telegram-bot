@@ -47,11 +47,6 @@ STATE_EXPECTING_MFA = "expecting_mfa"
 
 
 # --- Utilities: parsing + validation dispatch ---
-def _strip_comment_and_parse_value(line: str):
-    """Strips comments and leading/trailing whitespace."""
-    before = line.split("#", 1)[0].strip()
-    return before
-
 def get_user_profile_key(user_id: int) -> str:
     """Returns the profile key for a given user ID."""
     return USER_PROFILES.get(user_id, DEFAULT_PROFILE)
@@ -137,11 +132,11 @@ def _run_garmin_script(user_id: int, data: dict, email: str = None, password: st
     Returns (code, stdout, stderr) where code is one of garminconnectapi's EXIT_*
     values. LLM feedback is best-effort and never affects the submission result.
     """
-    config = garminconnectapi.Config(user_id=user_id)
+    tokenstore = garminconnectapi.tokenstore_path(user_id)
 
     try:
         api_instance = garminconnectapi.init_api(
-            tokenstore_path=config.tokenstore,
+            tokenstore_path=tokenstore,
             email=email,
             password=password,
             mfa_code=mfa_code,
@@ -226,7 +221,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Handle New Data Submission (Initial attempt)
     else:
-        lines = [_strip_comment_and_parse_value(l) for l in text.splitlines() if l.strip() != ""]
+        lines = [l.split("#", 1)[0].strip() for l in text.splitlines() if l.strip()]
         try:
             # --- VALIDATION DISPATCH HERE ---
             data = _validate_and_cast_dispatch(user_id, lines)

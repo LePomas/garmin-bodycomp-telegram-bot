@@ -43,58 +43,24 @@ logging.getLogger("garminconnect").setLevel(logging.CRITICAL)
 # API instance placeholder
 api = None
 
-class Config:
-    """Configuration class for Garmin Connect API."""
-
-    def __init__(self, user_id: int):
-        # Base token path from environment, falls back to a multi-user default
-        base_token_path = os.getenv("GARMINTOKENS_BASE") or "~/.garth"
-
-        # Unique tokenstore path per user
-        user_dir = f"tg_{user_id}"
-
-        # Use Path for reliable path construction and tilde expansion
-        self.tokenstore = Path(os.path.expanduser(base_token_path)) / user_dir
-        self.tokenstore.mkdir(parents=True, exist_ok=True) # Ensure directory exists
-
-        # Date settings
-        self.today = datetime.date.today()
-
-        # Export settings (simplified)
-        self.export_dir = Path("your_data")
-        self.export_dir.mkdir(exist_ok=True)
+def tokenstore_path(user_id: int) -> Path:
+    """Per-user Garmin token directory (created if missing)."""
+    base = os.getenv("GARMINTOKENS_BASE") or "~/.garth"
+    path = Path(os.path.expanduser(base)) / f"tg_{user_id}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def safe_api_call(api_method, *args, method_name: str = None, **kwargs):
-    """
-    Centralized API call wrapper with comprehensive error handling.
-    """
+    """Call a Garmin API method, returning (ok, message)."""
     if method_name is None:
         method_name = getattr(api_method, "__name__", str(api_method))
 
     try:
         api_method(*args, **kwargs)
         return True, "Data successfully submitted"
-
-    except GarthHTTPError as e:
-        error_msg = f"HTTP error: {e}"
-        # --- EMOJI REMOVAL FIX ---
-        return False, f"Error: {method_name} failed: {error_msg}"
-
-    except GarminConnectAuthenticationError as e:
-        error_msg = f"Authentication issue: {e}"
-        # --- EMOJI REMOVAL FIX ---
-        return False, f"Error: {method_name} failed: {error_msg}"
-
-    except GarminConnectConnectionError as e:
-        error_msg = f"Connection issue: {e}"
-        # --- EMOJI REMOVAL FIX ---
-        return False, f"Error: {method_name} failed: {error_msg}"
-
     except Exception as e:
-        error_msg = f"Unexpected error: {e}"
-        # --- EMOJI REMOVAL FIX ---
-        return False, f"Error: {method_name} failed: {error_msg}"
+        return False, f"Error: {method_name} failed: {e}"
 
 
 def add_body_composition_data_non_interactive(api: Garmin, data: dict) -> bool:
