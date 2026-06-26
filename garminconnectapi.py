@@ -6,7 +6,6 @@ Refactored for non-interactive use with Telegram bot via CLI arguments and exit 
 Now supports multi-user profiles and extended body composition fields.
 """
 
-import argparse
 import datetime
 import os
 import sys
@@ -24,6 +23,15 @@ EXIT_SUBMISSION_ERROR = 1
 EXIT_TOKEN_FAILURE = 2
 EXIT_MFA_REQUIRED = 3
 EXIT_TOO_MANY_MFA = 4
+
+
+class GarminLoginError(Exception):
+    """Login failed in-process; carries one of the EXIT_* status codes."""
+
+    def __init__(self, code: int, message: str = ""):
+        self.code = code
+        super().__init__(message or f"login failed (code {code})")
+
 
 load_dotenv()
 
@@ -130,8 +138,12 @@ def add_body_composition_data_non_interactive(api: Garmin, data: dict) -> bool:
         return False
 
 
-def init_api(tokenstore_path: Path, email: str | None = None, password: str | None = None, mfa_code: str | None = None) -> Garmin | None:
-    """Initialize Garmin API with smart error handling and recovery using user-specific tokenstore."""
+def init_api(tokenstore_path: Path, email: str | None = None, password: str | None = None, mfa_code: str | None = None) -> Garmin:
+    """Initialize Garmin API using a user-specific tokenstore.
+
+    Returns a logged-in Garmin instance, or raises GarminLoginError carrying an
+    EXIT_* status code the caller maps to a user-facing reply.
+    """
 
     # 1. Try token-based login first
     try:
@@ -142,9 +154,9 @@ def init_api(tokenstore_path: Path, email: str | None = None, password: str | No
     except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError, GarminConnectConnectionError):
         pass
 
-    # If no credentials provided, exit with TOKEN_FAILURE
+    # No saved token and no credentials -> ask the user for credentials
     if not email or not password:
-        sys.exit(EXIT_TOKEN_FAILURE)
+        raise GarminLoginError(EXIT_TOKEN_FAILURE)
 
     # 2. Try credential-based login
     try:
@@ -154,7 +166,7 @@ def init_api(tokenstore_path: Path, email: str | None = None, password: str | No
         # Handle MFA
         if result1 == "needs_mfa":
             if not mfa_code:
-                sys.exit(EXIT_MFA_REQUIRED)
+                raise GarminLoginError(EXIT_MFA_REQUIRED)
 
             # Resume login with MFA code
             try:
@@ -162,128 +174,26 @@ def init_api(tokenstore_path: Path, email: str | None = None, password: str | No
             except GarthHTTPError as garth_error:
                 error_str = str(garth_error)
                 if "429" in error_str and "Too Many Requests" in error_str:
-                    print("❌ Too many MFA attempts", file=sys.stderr)
-                    sys.exit(EXIT_TOO_MANY_MFA)
-                elif "401" in error_str or "403" in error_str:
-                    print("❌ Invalid MFA code", file=sys.stderr)
-                    sys.exit(EXIT_MFA_REQUIRED)
-                else:
-                    print(f"❌ MFA authentication failed: {garth_error}", file=sys.stderr)
-                    sys.exit(EXIT_SUBMISSION_ERROR)
+                    raise GarminLoginError(EXIT_TOO_MANY_MFA, "Too many MFA attempts")
+                if "401" in error_str or "403" in error_str:
+                    raise GarminLoginError(EXIT_MFA_REQUIRED, "Invalid MFA code")
+                raise GarminLoginError(
+                    EXIT_SUBMISSION_ERROR, f"MFA authentication failed: {garth_error}"
+                )
             except GarthException as garth_error:
-                print(f"❌ MFA authentication failed: {garth_error}", file=sys.stderr)
-                sys.exit(EXIT_MFA_REQUIRED)
+                raise GarminLoginError(
+                    EXIT_MFA_REQUIRED, f"MFA authentication failed: {garth_error}"
+                )
 
         # 3. Save tokens and return API instance
         garmin.garth.dump(str(tokenstore_path))
         return garmin
 
     except GarminConnectAuthenticationError:
-        print("❌ Authentication failed: Invalid username or password", file=sys.stderr)
-        sys.exit(EXIT_SUBMISSION_ERROR)
+        raise GarminLoginError(
+            EXIT_SUBMISSION_ERROR, "Authentication failed: invalid username or password"
+        )
 
     except (FileNotFoundError, GarthHTTPError, GarthException,
             GarminConnectConnectionError, requests.exceptions.HTTPError) as err:
-        print(f"❌ Connection error during login: {err}", file=sys.stderr)
-        sys.exit(EXIT_SUBMISSION_ERROR)
-
-# >>> Add this to garminconnectapi.py (after init_api)
-def init_api_inprocess(tokenstore_path: Path, email: str | None = None, password: str | None = None, mfa_code: str | None = None):
-    """
-    Safe wrapper for init_api when used in-process (e.g. called by a running bot).
-    Returns: (garmin_instance_or_None, exit_code)
-      - garmin_instance_or_None: Garmin instance on success, else None
-      - exit_code: 0 on success or one of the EXIT_* codes (matching CLI behavior)
-    This prevents init_api's sys.exit() from terminating the bot process.
-    """
-    try:
-        garmin = init_api(tokenstore_path=tokenstore_path, email=email, password=password, mfa_code=mfa_code)
-        if garmin:
-            return garmin, 0
-        # init_api may return None in some code paths (rare)
-        return None, EXIT_SUBMISSION_ERROR
-    except SystemExit as se:
-        # init_api uses sys.exit() to signal conditions; map those to the same codes without exiting
-        code = se.code if isinstance(se.code, int) else EXIT_SUBMISSION_ERROR
-        return None, code
-    except Exception as e:
-        # unexpected exception, map to submission error and don't crash
-        print(f"init_api_inprocess unexpected error: {e}", file=sys.stderr)
-        return None, EXIT_SUBMISSION_ERROR
-
-
-def main():
-    """Main function to add body composition data."""
-
-    parser = argparse.ArgumentParser(description="Add body composition data to Garmin Connect.")
-    parser.add_argument("--user-id", type=int, required=True, help="Telegram User ID for unique token storage.")
-
-    # Login arguments (optional for token refresh)
-    parser.add_argument("--email", type=str, help="Garmin account email address.")
-    parser.add_argument("--password", type=str, help="Garmin account password.")
-    parser.add_argument("--mfa-code", type=str, help="Multi-factor authentication code.")
-
-    # Body composition data arguments (required for submission)
-    parser.add_argument("--weight", type=float, required=True, help="Weight in kg.")
-    parser.add_argument("--muscle-mass", type=float, required=True, help="Muscle mass in kg.")
-
-    # Common Optional arguments
-    parser.add_argument("--bmi", type=float, help="Body Mass Index.")
-    parser.add_argument("--percent-fat", type=float, help="Body fat percentage.")
-    parser.add_argument("--visceral-fat-rating", type=int, help="Visceral fat rating.")
-
-    # --- NEW: Mi Scale Arguments ---
-    parser.add_argument("--percent-hydration", type=float, help="Body hydration percentage.")
-    parser.add_argument("--bone-mass", type=float, help="Bone mass in kg.")
-
-    # Optional defaults from original script (can be extended)
-    parser.add_argument("--metabolic-age", type=int, default=None, help="Metabolic age.")
-    parser.add_argument("--basal-met", type=int, default=None, help="Basal metabolic rate.")
-
-    args = parser.parse_args()
-
-    # Initialize configuration with the provided user ID
-    global config
-    config = Config(user_id=args.user_id)
-
-    # --- Login/API Initialization ---
-    api_instance = init_api(
-        tokenstore_path=config.tokenstore,
-        email=args.email,
-        password=args.password,
-        mfa_code=args.mfa_code
-    )
-
-    if not api_instance:
-        # init_api already called sys.exit() with the appropriate code
-        return
-
-    # --- Data Submission ---
-
-    # Prepare data dictionary from arguments
-    body_data = {
-        "weight": args.weight,
-        "bmi": args.bmi,
-        "percent_fat": args.percent_fat,
-        "muscle_mass": args.muscle_mass,
-        "visceral_fat_rating": args.visceral_fat_rating,
-
-        # Include new Mi Scale fields (will be None for OMRON profile)
-        "percent_hydration": args.percent_hydration,
-        "bone_mass": args.bone_mass,
-
-        "metabolic_age": args.metabolic_age,
-        "basal_met": args.basal_met,
-    }
-
-    if api_instance:
-        if add_body_composition_data_non_interactive(api_instance, body_data):
-            sys.exit(EXIT_SUCCESS)
-        else:
-            sys.exit(EXIT_SUBMISSION_ERROR)
-    else:
-        sys.exit(EXIT_SUBMISSION_ERROR)
-
-
-if __name__ == "__main__":
-    main()
+        raise GarminLoginError(EXIT_SUBMISSION_ERROR, f"Connection error during login: {err}")
