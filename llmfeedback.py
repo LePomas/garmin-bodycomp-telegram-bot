@@ -1,195 +1,184 @@
 import datetime
 import os
+import statistics
 import sys
-from typing import Optional, Dict, Any
 
 from dotenv import load_dotenv
-from garminconnect import Garmin
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
 
-# --- LLM API Configuration ---
+# --- LLM API Configuration (all overridable via env) ---
 API_KEY = os.getenv("GOOGLE_API_KEY", "")
-API_MODEL = "gemini-2.5-flash-lite"
+API_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+API_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0"))
+API_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "15"))
+API_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 
-# Initialize the LLM client once
-llm = ChatGoogleGenerativeAI(
-    model=API_MODEL,
-    temperature=0,
-    max_tokens=None,
-    timeout=15,
-    max_retries=2,
-)
+TREND_KEYS = ("weight_kg", "body_fat_percent", "muscle_mass_kg")
+
+_llm = None
 
 
-# --- Data Fetching and Processing ---
+def _get_llm():
+    """Build the Gemini client on first use (keeps import side-effect free)."""
+    global _llm
+    if _llm is None:
+        _llm = ChatGoogleGenerativeAI(
+            model=API_MODEL,
+            temperature=API_TEMPERATURE,
+            max_tokens=None,
+            timeout=API_TIMEOUT,
+            max_retries=API_MAX_RETRIES,
+        )
+    return _llm
 
-def fetch_latest_body_composition(api: Garmin) -> Optional[Dict[str, Any]]:
-    """
-    Fetches the latest body composition data (weight, body fat, muscle mass)
-    over a 3-month period to determine trends.
+
+# --- Data fetching and trend math (pure, unit-tested in test_llmfeedback.py) ---
+
+def _to_kg(grams):
+    """Garmin reports weight/muscle mass in grams; convert to kg. None stays None."""
+    return grams / 1000.0 if grams else None
+
+
+def normalize_entry(entry: dict) -> dict:
+    """One Garmin dateWeightList row -> normalized metrics (kg, percent)."""
+    return {
+        "date": entry.get("calendarDate"),
+        "weight_kg": _to_kg(entry.get("weight")),
+        "body_fat_percent": entry.get("bodyFat"),
+        "muscle_mass_kg": _to_kg(entry.get("muscleMass")),
+    }
+
+
+def fetch_body_composition_series(api, days: int = 90):
+    """Normalized body-comp series over the window, oldest first.
+
+    Returns the list, or None on API error / no data.
     """
     try:
-        # Define a 3-month range for reliable trend comparison (as suggested by user)
-        end_date = datetime.date.today()
-        start_date = end_date - datetime.timedelta(days=90)
-
-        # Call the body composition API
-        data = api.get_body_composition(start_date.isoformat(), end_date.isoformat())
-
-        # The relevant data is in dateWeightList
-        weight_list = data.get('dateWeightList', [])
-
-        if not weight_list:
-            return None
-
-        # Sort by calendarDate (newest first)
-        weight_list.sort(key=lambda x: x.get('calendarDate', '0'), reverse=True)
-
-        # Filter for the most recent log that contains a valid Body Fat value for a meaningful comparison
-        meaningful_entries = [
-            e for e in weight_list
-            if e.get('bodyFat') is not None and e.get('bodyFat') > 0
-        ]
-
-        if not meaningful_entries:
-            # Fallback to just the most recent entry if no full body comp data exists
-            latest = weight_list[0]
-            previous = None
-        else:
-            latest = meaningful_entries[0]
-            previous = meaningful_entries[1] if len(meaningful_entries) > 1 else None
-
-        # Data normalization (Garmin returns weight/muscle mass in grams/mg, need kg/percent)
-        def normalize(entry):
-            if not entry: return None
-            # Weight is stored as mg/g, divide by 1000 to get kg
-            weight_kg = (entry.get('weight') / 1000.0) if entry.get('weight') else None
-            # Muscle mass is typically in grams/mg, convert to kg
-            muscle_mass_kg = (entry.get('muscleMass') / 1000.0) if entry.get('muscleMass') else None
-
-            return {
-                "weight_kg": weight_kg,
-                "body_fat_percent": entry.get('bodyFat'),
-                "muscle_mass_kg": muscle_mass_kg,
-                "date": entry.get('calendarDate'),
-            }
-
-        latest_data = normalize(latest)
-        previous_data = normalize(previous)
-
-        if not latest_data or not latest_data['weight_kg']:
-            return None
-
-        return {
-            "latest": latest_data,
-            "previous": previous_data,
-        }
-
+        end = datetime.date.today()
+        start = end - datetime.timedelta(days=days)
+        data = api.get_body_composition(start.isoformat(), end.isoformat())
     except Exception as e:
         print(f"LLMFeedback: Error fetching body composition data: {e}", file=sys.stderr)
         return None
 
+    rows = (data or {}).get("dateWeightList", [])
+    series = [normalize_entry(r) for r in rows if r.get("weight")]
+    series.sort(key=lambda r: r["date"] or "")
+    return series or None
 
-def generate_feedback_message(data: Dict[str, Any]) -> Optional[str]:
-    """Calls the Gemini API (via LangChain) to generate a personalized feedback message."""
-    latest = data['latest']
-    previous = data['previous']
 
-    trend_descriptions = []
+def _metric_trend(series: list, key: str):
+    """Least-squares trend for one metric over the window.
 
-    # 1. Weight Trend
-    latest_w = latest['weight_kg']
-    if previous and previous['weight_kg']:
-        previous_w = previous['weight_kg']
-        weight_diff = round(latest_w - previous_w, 2)
-        trend_descriptions.append(f"Weight change: {weight_diff:+.2f} kg.")
-    else:
-        trend_descriptions.append(f"Current weight: {latest_w:.2f} kg. No recent weight comparison.")
+    Returns {current, change, span_days, n} where `change` is the modeled change
+    (slope * span) across the window, or None if the metric has no data. `change`
+    is None when there is only one point or a single day of data.
+    """
+    pts = [(r["date"], r[key]) for r in series if r.get(key) is not None and r.get("date")]
+    if not pts:
+        return None
 
-    # 2. Body Fat Trend (if available)
-    latest_bf = latest.get('body_fat_percent')
-    if latest_bf and previous and previous.get('body_fat_percent'):
-        previous_bf = previous['body_fat_percent']
-        bf_diff = round(latest_bf - previous_bf, 2)
-        trend_descriptions.append(f"Body Fat change: {bf_diff:+.2f}%.")
+    current = pts[-1][1]
+    if len(pts) < 2:
+        return {"current": current, "change": None, "span_days": 0, "n": 1}
 
-    # 3. Muscle Mass Trend (if available)
-    latest_mm = latest.get('muscle_mass_kg')
-    if latest_mm and previous and previous.get('muscle_mass_kg'):
-        previous_mm = previous['muscle_mass_kg']
-        mm_diff = round(latest_mm - previous_mm, 2)
-        trend_descriptions.append(f"Muscle Mass change: {mm_diff:+.2f} kg.")
+    day0 = datetime.date.fromisoformat(pts[0][0])
+    xs = [(datetime.date.fromisoformat(d) - day0).days for d, _ in pts]
+    ys = [float(v) for _, v in pts]
+    span = xs[-1] - xs[0]
+    if span <= 0:
+        return {"current": current, "change": None, "span_days": 0, "n": len(pts)}
+
+    slope, _ = statistics.linear_regression(xs, ys)
+    return {"current": current, "change": round(slope * span, 2), "span_days": span, "n": len(pts)}
+
+
+def compute_trends(series: list) -> dict:
+    """Per-metric trend dict keyed by TREND_KEYS."""
+    return {k: _metric_trend(series, k) for k in TREND_KEYS}
+
+
+def describe_trends(trends: dict) -> list:
+    """Human-readable trend lines for the LLM prompt."""
+    out = []
+
+    w = trends.get("weight_kg")
+    if w:
+        if w["change"] is not None:
+            out.append(f"Weight {w['change']:+.2f} kg over {w['span_days']} days (now {w['current']:.2f} kg).")
+        else:
+            out.append(f"Current weight {w['current']:.2f} kg (no trend yet).")
+
+    bf = trends.get("body_fat_percent")
+    if bf and bf["change"] is not None:
+        out.append(f"Body fat {bf['change']:+.2f}% over {bf['span_days']} days.")
+
+    mm = trends.get("muscle_mass_kg")
+    if mm and mm["change"] is not None:
+        out.append(f"Muscle mass {mm['change']:+.2f} kg over {mm['span_days']} days.")
+
+    return out
+
+
+def generate_feedback_message(trends: dict):
+    """Ask Gemini for a short motivating message from the computed trends."""
+    descriptions = describe_trends(trends)
+    if not descriptions:
+        return None
 
     user_query = (
-        f"The user logged new body composition data on {latest.get('date')}. "
-        f"Metrics: {'; '.join(trend_descriptions)}. "
-        f"Generate a short, motivating feedback message (under 260 characters) focusing on the most positive trend, "
-        f"such as fat loss or muscle gain. If data is limited or neutral, focus on consistency."
+        "The user just logged new body composition data. "
+        f"Trends over the recent window: {' '.join(descriptions)} "
+        "Generate a short, motivating feedback message (under 260 characters) focusing on "
+        "the most positive trend, such as fat loss or muscle gain. If data is limited or "
+        "neutral, focus on consistency."
     )
-
-    # Define System Instruction and LangChain Messages
     system_prompt = (
         "Act as a friendly, motivating, and highly concise fitness coach. "
         "Your response MUST be under 260 characters. Do not use quotes, only the message text with some emojis."
     )
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_query)]
 
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_query),
-    ]
-
-    # LangChain API Call
     try:
-        ai_msg = llm.invoke(messages)
-        text = ai_msg.content.strip()
-
+        ai_msg = _get_llm().invoke(messages)
+        text = (ai_msg.content or "").strip()
         if text:
-            # ONLY print the final message to stdout
             return text
-
         print("LLMFeedback: Received empty content from LLM invocation.", file=sys.stderr)
-
     except Exception as e:
         print(f"LLMFeedback: LangChain invocation failed after retries: {e}", file=sys.stderr)
 
     return None
 
-# >>> Add this to llmfeedback.py (near the end, before/after main)
+
 def get_feedback(api):
-    """
-    Programmatic helper for in-process usage.
-    Returns a feedback string (<=150 chars) or None if no feedback could be generated.
-    This does not call sys.exit() so it is safe to call from a running bot.
-    """
+    """Programmatic helper for in-process use by the bot. Never raises."""
     if not API_KEY:
-        # LLM optional — skip silently if API key not set
         print("LLMFeedback: GOOGLE_API_KEY not set, skipping AI feedback.", file=sys.stderr)
         return None
     try:
-        data = fetch_latest_body_composition(api)
-        if not data:
+        series = fetch_body_composition_series(api)
+        if not series:
             return None
-        feedback = generate_feedback_message(data)
-        return feedback
+        return generate_feedback_message(compute_trends(series))
     except Exception as e:
         print(f"LLMFeedback: get_feedback failed: {e}", file=sys.stderr)
         return None
 
 
-def main(api: Garmin):
-    """Main execution function for generating feedback."""
+def main(api):
+    """Standalone feedback run (prints message, exits 0 on success)."""
     if not API_KEY:
         print("LLMFeedback: ERROR: GOOGLE_API_KEY is not set.", file=sys.stderr)
         sys.exit(1)
 
-    # UPDATED FUNCTION CALL
-    data = fetch_latest_body_composition(api)
-
-    if data:
-        feedback = generate_feedback_message(data)
+    series = fetch_body_composition_series(api)
+    if series:
+        feedback = generate_feedback_message(compute_trends(series))
         if feedback:
             print(feedback)
             sys.exit(0)
