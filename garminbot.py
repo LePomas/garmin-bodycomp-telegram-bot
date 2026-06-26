@@ -1,12 +1,11 @@
 # garminbot.py
 import os
-import shlex
-import subprocess
-import sys
 
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
+
+import garminconnectapi
 
 load_dotenv()
 
@@ -42,24 +41,12 @@ if USER_PROFILES_STR:
 # Fallback profile if not explicitly set
 DEFAULT_PROFILE = "OMRON"
 
-GARMIN_SCRIPT_PATH = "./garminconnectapi.py"
-
-# --- VIRTUAL ENVIRONMENT PYTHON EXECUTABLE PATH (Ensure this is correct for your system) ---
-VENV_PYTHON_EXE = os.path.expanduser("~/.venv/Scripts/python.exe")
-if not os.path.exists(VENV_PYTHON_EXE):
-    VENV_PYTHON_EXE = sys.executable
-
 # --- State Management ---
 STATE_EXPECTING_CREDENTIALS = "expecting_credentials"
 STATE_EXPECTING_MFA = "expecting_mfa"
 
 
 # --- Utilities: parsing + validation dispatch ---
-def _strip_comment_and_parse_value(line: str):
-    """Strips comments and leading/trailing whitespace."""
-    before = line.split("#", 1)[0].strip()
-    return before
-
 def get_user_profile_key(user_id: int) -> str:
     """Returns the profile key for a given user ID."""
     return USER_PROFILES.get(user_id, DEFAULT_PROFILE)
@@ -139,99 +126,37 @@ def _validate_and_cast_dispatch(user_id: int, lines: list):
         raise ValueError(f"Unknown profile key: {profile_key} assigned to user ID {user_id}.")
 
 
-# >>> Replace existing _run_garmin_script with the following in garminbot.py
-
 def _run_garmin_script(user_id: int, data: dict, email: str = None, password: str = None, mfa_code: str = None):
+    """Submit body composition in-process via garminconnectapi.
+
+    Returns (code, stdout, stderr) where code is one of garminconnectapi's EXIT_*
+    values. LLM feedback is best-effort and never affects the submission result.
     """
-    Attempt an in-process submission first (safer, faster). If anything goes wrong
-    (import error, unexpected exceptions, or non-zero result), fall back to subprocess
-    to preserve existing behavior.
-    Returns: (exit_code, stdout, stderr)
-    - exit_code: matches the EXIT_* codes used by garminconnectapi.py when possible.
-    - stdout/stderr: strings (some may be None for in-process mode).
-    """
-    # 1) Try in-process
+    tokenstore = garminconnectapi.tokenstore_path(user_id)
+
     try:
-        import importlib
-        garminapi = importlib.import_module("garminconnectapi")
-        # Ensure we have the safe wrapper (init_api_inprocess) available
-        if not hasattr(garminapi, "init_api_inprocess"):
-            raise ImportError("garminconnectapi missing init_api_inprocess wrapper")
-
-        # Build config for user and call safe init
-        config = garminapi.Config(user_id=user_id)
-        api_instance, code = garminapi.init_api_inprocess(tokenstore_path=config.tokenstore, email=email, password=password, mfa_code=mfa_code)
-        if api_instance is None:
-            # code may be one of the EXIT_* codes
-            return code, None, f"In-process init returned code {code}"
-
-        # Call actual submission function
-        success = garminapi.add_body_composition_data_non_interactive(api_instance, data)
-
-        if success:
-            # Optional: call LLM feedback in-process but do NOT let failures affect the main flow
-            try:
-                # Attempt to import llmfeedback and call the helper
-                llm_mod = importlib.import_module("llmfeedback")
-                if hasattr(llm_mod, "get_feedback"):
-                    feedback = llm_mod.get_feedback(api_instance)
-                    if feedback:
-                        # Return feedback in stdout (so caller can append it)
-                        return 0, f"Success: Data submitted. LLM: {feedback}", None
-                # No feedback (or no helper)
-                return 0, "Success: Data submitted.", None
-            except Exception as e:
-                # If LLM fails for any reason, ignore and return success (but include stderr info for debugging)
-                return 0, "Success: Data submitted.", f"LLM call failed: {e}"
-        else:
-            return 1, None, "Submission failed (in-process add_body_composition_data_non_interactive returned False)"
-
-    except Exception as e:
-        # If anything goes wrong in in-process path, fallback to subprocess to preserve compatibility
-        # Keep the old subprocess behavior
-        pass
-
-    # 2) Fallback: original subprocess invocation (keeps CLI interface working)
-    try:
-        cmd = [
-            VENV_PYTHON_EXE,
-            GARMIN_SCRIPT_PATH,
-            f"--user-id={user_id}",
-            f"--weight={data['weight']}",
-            f"--muscle-mass={data['muscle_mass']}",
-        ]
-
-        if data.get("bmi") is not None:
-            cmd.append(f"--bmi={data['bmi']}")
-        if data.get("percent_fat") is not None:
-            cmd.append(f"--percent-fat={data['percent_fat']}")
-        if data.get("visceral_fat_rating") is not None:
-            cmd.append(f"--visceral-fat-rating={data['visceral_fat_rating']}")
-        if data.get("percent_hydration") is not None:
-            cmd.append(f"--percent-hydration={data['percent_hydration']}")
-        if data.get("bone_mass") is not None:
-            cmd.append(f"--bone-mass={data['bone_mass']}")
-
-        if email:
-            cmd.append(f"--email={email}")
-        if password:
-            cmd.append(f"--password={password}")
-        if mfa_code:
-            cmd.append(f"--mfa-code={mfa_code}")
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            encoding="utf-8",
-            errors="replace"
+        api_instance = garminconnectapi.init_api(
+            tokenstore_path=tokenstore,
+            email=email,
+            password=password,
+            mfa_code=mfa_code,
         )
-        return result.returncode, result.stdout, result.stderr
-    except FileNotFoundError:
-        return 99, None, f"Error: Python interpreter or script not found. Check VENV_PYTHON_EXE or GARMIN_SCRIPT_PATH."
+    except garminconnectapi.GarminLoginError as e:
+        return e.code, None, str(e)
+
+    if not garminconnectapi.add_body_composition_data_non_interactive(api_instance, data):
+        return garminconnectapi.EXIT_SUBMISSION_ERROR, None, "Submission failed"
+
+    # Optional LLM feedback: a failure here must not fail the submission.
+    try:
+        import llmfeedback
+        feedback = llmfeedback.get_feedback(api_instance)
+        if feedback:
+            return garminconnectapi.EXIT_SUCCESS, f"Success: Data submitted. LLM: {feedback}", None
     except Exception as e:
-        return 99, None, f"Subprocess failed: {e}"
+        return garminconnectapi.EXIT_SUCCESS, "Success: Data submitted.", f"LLM call failed: {e}"
+
+    return garminconnectapi.EXIT_SUCCESS, "Success: Data submitted.", None
 
 
 
@@ -296,7 +221,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Handle New Data Submission (Initial attempt)
     else:
-        lines = [_strip_comment_and_parse_value(l) for l in text.splitlines() if l.strip() != ""]
+        lines = [l.split("#", 1)[0].strip() for l in text.splitlines() if l.strip()]
         try:
             # --- VALIDATION DISPATCH HERE ---
             data = _validate_and_cast_dispatch(user_id, lines)
@@ -372,25 +297,14 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Starts the bot."""
-    if not os.path.exists(GARMIN_SCRIPT_PATH):
-        print(f"Error: Garmin script not found at '{GARMIN_SCRIPT_PATH}'")
-        sys.exit(1)
-
-    if not os.path.exists(VENV_PYTHON_EXE):
-        print(f"Error: Venv Python executable not found at '{VENV_PYTHON_EXE}'")
-        sys.exit(1)
-
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))
 
     print("Running bot to process body composition data...")
-    print(f"Using Python executable: {VENV_PYTHON_EXE}")
     print(f"Authorized IDs loaded: {len(ALLOWED_IDS)}")
     print(f"User Profiles loaded: {len(USER_PROFILES)}")
     app.run_polling(poll_interval=1.0)
 
 
 if __name__ == "__main__":
-    from pathlib import Path
-    sys.path.append(str(Path(__file__).parent.resolve()))
     main()
