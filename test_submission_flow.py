@@ -38,7 +38,7 @@ def make_fake_garmin(scenario: dict):
     class FakeGarmin:
         def __init__(self, email=None, password=None, is_cn=False, return_on_mfa=False):
             self.cred_mode = email is not None
-            self.garth = types.SimpleNamespace(dump=lambda path: None)
+            self.client = types.SimpleNamespace(dump=lambda path: None)
 
         def login(self, tokenstore=None):
             if not self.cred_mode:

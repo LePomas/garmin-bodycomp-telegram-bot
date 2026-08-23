@@ -1,6 +1,6 @@
 python-dotenv
 python-telegram-bot
 requests
-garminconnect
-garth
+garminconnect==0.3.11
+garth==0.8.0
 langchain-google-genai

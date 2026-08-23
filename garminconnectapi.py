@@ -152,7 +152,7 @@ def init_api(tokenstore_path: Path, email: str | None = None, password: str | No
                 )
 
         # 3. Save tokens and return API instance
-        garmin.garth.dump(str(tokenstore_path))
+        garmin.client.dump(str(tokenstore_path))
         return garmin
 
     except GarminConnectAuthenticationError:
